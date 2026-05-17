@@ -348,6 +348,240 @@ impl Fat32 {
         Ok(data)
     }
 
+    // -------------------------------------------------------------------------
+    // Write path — Phase Future : alloc cluster, update FAT, write data,
+    // patch dir entry. Limité au répertoire racine, noms 8.3 uniquement,
+    // mode "truncate" (réécriture complète).
+    // -------------------------------------------------------------------------
+
+    /// Met à jour une entrée FAT (sur les deux copies FAT si num_fats=2).
+    fn set_fat_entry(&self, cluster: u32, value: u32) -> Result<(), &'static str> {
+        let fat_offset = cluster * 4;
+        let entry_offset = (fat_offset % SECTOR_SIZE as u32) as usize;
+        let fat_sector_rel = fat_offset / SECTOR_SIZE as u32;
+
+        for fat_idx in 0..self.bpb.num_fats as u32 {
+            let lba = self.fat_start_lba + fat_idx * self.bpb.sectors_per_fat + fat_sector_rel;
+            let mut buf = [0u8; SECTOR_SIZE];
+            ata::read(self.disk_idx, lba, 1, &mut buf)?;
+
+            // Préserve les 4 bits hauts (réservés FAT32).
+            let prev = u32::from_le_bytes([
+                buf[entry_offset], buf[entry_offset+1],
+                buf[entry_offset+2], buf[entry_offset+3],
+            ]);
+            let new_val = (prev & 0xF000_0000) | (value & 0x0FFF_FFFF);
+            let b = new_val.to_le_bytes();
+            buf[entry_offset]   = b[0];
+            buf[entry_offset+1] = b[1];
+            buf[entry_offset+2] = b[2];
+            buf[entry_offset+3] = b[3];
+
+            ata::write(self.disk_idx, lba, 1, &buf)?;
+        }
+        Ok(())
+    }
+
+    /// Cherche un cluster libre (FAT entry == 0). Marque EOF dans la FAT.
+    fn alloc_cluster(&self) -> Result<u32, &'static str> {
+        let entries_per_sector = SECTOR_SIZE as u32 / 4;
+        let total_clusters = self.bpb.sectors_per_fat * entries_per_sector;
+        let mut buf = [0u8; SECTOR_SIZE];
+
+        for sec in 0..self.bpb.sectors_per_fat {
+            let lba = self.fat_start_lba + sec;
+            ata::read(self.disk_idx, lba, 1, &mut buf)?;
+            for i in 0..entries_per_sector {
+                let cluster = sec * entries_per_sector + i;
+                // Cluster 0 et 1 sont réservés.
+                if cluster < 2 { continue; }
+                if cluster >= total_clusters { return Err("FAT32: plus de clusters libres"); }
+                let off = (i * 4) as usize;
+                let val = u32::from_le_bytes([buf[off], buf[off+1], buf[off+2], buf[off+3]])
+                    & 0x0FFF_FFFF;
+                if val == 0 {
+                    self.set_fat_entry(cluster, 0x0FFF_FFFF)?; // EOF
+                    return Ok(cluster);
+                }
+            }
+        }
+        Err("FAT32: scan FAT épuisé")
+    }
+
+    /// Écrit `data` dans un cluster (zero-pad le reste).
+    fn write_cluster(&self, cluster: u32, data: &[u8]) -> Result<(), &'static str> {
+        let cluster_bytes = self.bpb.sectors_per_cluster as usize * SECTOR_SIZE;
+        if data.len() > cluster_bytes { return Err("FAT32: data > cluster_size"); }
+
+        let lba = self.cluster_to_lba(cluster);
+        let mut buf = alloc::vec![0u8; cluster_bytes];
+        buf[..data.len()].copy_from_slice(data);
+        ata::write(self.disk_idx, lba, self.bpb.sectors_per_cluster, &buf)?;
+        Ok(())
+    }
+
+    /// Crée (ou écrase) un fichier nommé `name_83` à la racine.
+    /// `name_83` doit être ≤ 11 caractères en majuscules ASCII (8 + 3, sans le
+    /// point). Exemples valides : "README", "HELLO   TXT", "BOOT    INI".
+    ///
+    /// Allocation : autant de clusters que nécessaire, chaînés dans la FAT.
+    /// Free de l'ancienne chaîne si le fichier existait déjà.
+    pub fn create_root_file(&self, name_83: &str, data: &[u8]) -> Result<(), &'static str> {
+        let name_bytes = pack_short_name(name_83)?;
+
+        // Allocation des clusters pour les données.
+        let cluster_bytes = self.bpb.sectors_per_cluster as usize * SECTOR_SIZE;
+        let n_clusters = if data.is_empty() {
+            0
+        } else {
+            (data.len() + cluster_bytes - 1) / cluster_bytes
+        };
+        let mut chain: alloc::vec::Vec<u32> = alloc::vec::Vec::with_capacity(n_clusters);
+        for _ in 0..n_clusters {
+            chain.push(self.alloc_cluster()?);
+        }
+        // Lier la chaîne dans la FAT (le dernier reste EOF).
+        for w in chain.windows(2) {
+            self.set_fat_entry(w[0], w[1])?;
+        }
+
+        // Écriture des données dans les clusters.
+        for (i, c) in chain.iter().enumerate() {
+            let off = i * cluster_bytes;
+            let end = (off + cluster_bytes).min(data.len());
+            self.write_cluster(*c, &data[off..end])?;
+        }
+
+        // Patch de l'entrée de répertoire dans la racine.
+        let first_cluster = chain.first().copied().unwrap_or(0);
+        self.upsert_root_dir_entry(&name_bytes, first_cluster, data.len() as u32)?;
+        Ok(())
+    }
+
+    /// Insère ou remplace l'entrée 32 bytes correspondant à `name_83` dans la
+    /// racine. Format : 11 nom + 1 attr + 8 réservés + 2 hi-cluster + 8 dates
+    /// + 2 lo-cluster + 4 size.
+    fn upsert_root_dir_entry(
+        &self,
+        name_83: &[u8; 11],
+        first_cluster: u32,
+        size: u32,
+    ) -> Result<(), &'static str> {
+        let mut cur = self.bpb.root_cluster;
+        loop {
+            let lba_start = self.cluster_to_lba(cur);
+            let mut cluster_buf = alloc::vec![0u8;
+                self.bpb.sectors_per_cluster as usize * SECTOR_SIZE];
+            ata::read(self.disk_idx, lba_start, self.bpb.sectors_per_cluster, &mut cluster_buf)?;
+
+            // Walk les entrées 32-byte, cherche match name OR slot libre (0x00/0xE5).
+            let mut chosen_off: Option<usize> = None;
+            let mut chosen_is_replace = false;
+            for off in (0..cluster_buf.len()).step_by(32) {
+                let first = cluster_buf[off];
+                if first == 0x00 {
+                    chosen_off = Some(off);
+                    chosen_is_replace = false;
+                    break;
+                }
+                // Skip LFN entries
+                let attr = cluster_buf[off + 11];
+                if attr == 0x0F { continue; }
+                if first == 0xE5 {
+                    if chosen_off.is_none() {
+                        chosen_off = Some(off);
+                        chosen_is_replace = false;
+                    }
+                    continue;
+                }
+                if &cluster_buf[off..off+11] == name_83 {
+                    chosen_off = Some(off);
+                    chosen_is_replace = true;
+                    break;
+                }
+            }
+
+            if let Some(off) = chosen_off {
+                // Si on remplace, libère l'ancienne chaîne.
+                if chosen_is_replace {
+                    let hi = u16::from_le_bytes([cluster_buf[off+20], cluster_buf[off+21]]);
+                    let lo = u16::from_le_bytes([cluster_buf[off+26], cluster_buf[off+27]]);
+                    let old_first = ((hi as u32) << 16) | (lo as u32);
+                    self.free_chain(old_first)?;
+                }
+
+                let mut entry = [0u8; 32];
+                entry[..11].copy_from_slice(name_83);
+                entry[11] = 0x20; // ATTR_ARCHIVE
+                let hi = ((first_cluster >> 16) & 0xFFFF) as u16;
+                let lo = (first_cluster & 0xFFFF) as u16;
+                entry[20..22].copy_from_slice(&hi.to_le_bytes());
+                entry[26..28].copy_from_slice(&lo.to_le_bytes());
+                entry[28..32].copy_from_slice(&size.to_le_bytes());
+                cluster_buf[off..off+32].copy_from_slice(&entry);
+                ata::write(self.disk_idx, lba_start, self.bpb.sectors_per_cluster, &cluster_buf)?;
+                return Ok(());
+            }
+
+            // Pas de slot — passe au cluster suivant de la racine, ou alloue un
+            // nouveau cluster pour la racine.
+            match self.next_cluster(cur) {
+                Some(n) => cur = n,
+                None => {
+                    let new_c = self.alloc_cluster()?;
+                    self.set_fat_entry(cur, new_c)?;
+                    // Le cluster vient d'être alloué (zéroes via write_cluster
+                    // dans le prochain tour).
+                    self.write_cluster(new_c, &[])?;
+                    cur = new_c;
+                }
+            }
+        }
+    }
+
+    /// Libère une chaîne de clusters (set chaque entrée FAT à 0).
+    fn free_chain(&self, first: u32) -> Result<(), &'static str> {
+        if first < 2 { return Ok(()); }
+        let mut cur = first;
+        loop {
+            let next = self.next_cluster(cur);
+            self.set_fat_entry(cur, 0)?;
+            match next {
+                Some(n) => cur = n,
+                None => return Ok(()),
+            }
+        }
+    }
+
+    /// Supprime une entrée à la racine et libère sa chaîne.
+    pub fn unlink_root(&self, name_83: &str) -> Result<(), &'static str> {
+        let name_bytes = pack_short_name(name_83)?;
+        let mut cur = self.bpb.root_cluster;
+        loop {
+            let lba = self.cluster_to_lba(cur);
+            let mut cluster_buf = alloc::vec![0u8;
+                self.bpb.sectors_per_cluster as usize * SECTOR_SIZE];
+            ata::read(self.disk_idx, lba, self.bpb.sectors_per_cluster, &mut cluster_buf)?;
+            for off in (0..cluster_buf.len()).step_by(32) {
+                if cluster_buf[off] == 0x00 { return Err("FAT32: fichier non trouvé"); }
+                if cluster_buf[off + 11] == 0x0F { continue; }
+                if &cluster_buf[off..off+11] == &name_bytes {
+                    let hi = u16::from_le_bytes([cluster_buf[off+20], cluster_buf[off+21]]);
+                    let lo = u16::from_le_bytes([cluster_buf[off+26], cluster_buf[off+27]]);
+                    let first = ((hi as u32) << 16) | (lo as u32);
+                    self.free_chain(first)?;
+                    cluster_buf[off] = 0xE5;
+                    ata::write(self.disk_idx, lba, self.bpb.sectors_per_cluster, &cluster_buf)?;
+                    return Ok(());
+                }
+            }
+            match self.next_cluster(cur) {
+                Some(n) => cur = n,
+                None => return Err("FAT32: fichier non trouvé"),
+            }
+        }
+    }
+
     pub fn info_string(&self) -> String {
         let cluster_bytes = self.bpb.sectors_per_cluster as u32 * self.bpb.bytes_per_sector as u32;
         let data_clusters = (self.bpb.total_sectors
@@ -384,4 +618,34 @@ pub fn mount_first() -> Result<(), &'static str> {
 
 pub fn mounted() -> Option<&'static Mutex<Fat32>> {
     MOUNTED.get()
+}
+
+/// Convertit "README.TXT" / "BOOT.INI" / "HELLO" en buffer 11 bytes 8.3
+/// upper-case, padded espaces.
+fn pack_short_name(name: &str) -> Result<[u8; 11], &'static str> {
+    let upper: String = name.chars().map(|c| c.to_ascii_uppercase()).collect();
+    let (base, ext) = match upper.find('.') {
+        Some(i) => (&upper[..i], &upper[i+1..]),
+        None    => (upper.as_str(), ""),
+    };
+    if base.is_empty() || base.len() > 8 || ext.len() > 3 {
+        return Err("FAT32: nom invalide (8.3 only)");
+    }
+    let mut buf = [b' '; 11];
+    for (i, b) in base.bytes().enumerate() {
+        if !is_valid_short_byte(b) { return Err("FAT32: caractère invalide"); }
+        buf[i] = b;
+    }
+    for (i, b) in ext.bytes().enumerate() {
+        if !is_valid_short_byte(b) { return Err("FAT32: caractère invalide"); }
+        buf[8 + i] = b;
+    }
+    Ok(buf)
+}
+
+fn is_valid_short_byte(b: u8) -> bool {
+    matches!(b,
+        b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'-' | b'$' | b'%' | b'&' | b'!' | b'@'
+        | b'~' | b'(' | b')' | b'{' | b'}' | b'#' | b'^'
+    )
 }
