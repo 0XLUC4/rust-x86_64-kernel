@@ -211,6 +211,22 @@ impl AddressSpace {
         mapper.translate_addr(addr)
     }
 
+    /// Démappe une page utilisateur. Ne libère PAS la frame physique sous-jacente
+    /// (ownership est externe — utilisé par SHM unmap où la frame est partagée).
+    pub fn unmap_va(&mut self, vaddr: u64) -> Result<(), &'static str> {
+        let va_aligned = vaddr & !0xfff;
+        let page = Page::<Size4KiB>::containing_address(VirtAddr::new(va_aligned));
+        let mut mapper_guard = MAPPER_SLOTS.lock();
+        let mapper = mapper_guard.get_or_init(self.p4);
+        // SAFETY: P4 privée au process, mutex sérialise.
+        match mapper.unmap(page) {
+            Ok((_frame, flush)) => { flush.flush(); }
+            Err(_) => return Err("unmap_va: page non mappée"),
+        }
+        self.mapped_pages.remove(&va_aligned);
+        Ok(())
+    }
+
     /// Clone pour fork : copie la P4, marque toutes les pages basses RO + CoW.
     pub fn clone_cow(&mut self) -> Result<Self, &'static str> {
         let new_p4 = paging::alloc_zeroed_frame()?;
