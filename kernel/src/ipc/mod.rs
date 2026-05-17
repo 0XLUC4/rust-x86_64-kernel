@@ -59,9 +59,10 @@ static SHM_MAPPINGS: Mutex<Vec<ShmMapping>> = Mutex::new(Vec::new());
 static SHM_VA_NEXT: Mutex<BTreeMap<Pid, u64>> = Mutex::new(BTreeMap::new());
 static NEXT_HANDLE: AtomicU64 = AtomicU64::new(1);
 
-/// Mode de mapping (lecture seule, lecture/écriture). Le bit 0 = WRITABLE.
-pub const SHM_MODE_R:  u64 = 0;
-pub const SHM_MODE_RW: u64 = 1;
+/// Mode de mapping — bits alignés sur ulib (NR_SHM_MAP wrapper).
+/// SHM_READ = bit 0, SHM_WRITE = bit 1. WRITABLE ssi bit 1 set.
+pub const SHM_MODE_READ:  u64 = 1 << 0;
+pub const SHM_MODE_WRITE: u64 = 1 << 1;
 
 pub fn sys_shm_create(size: u64) -> u64 {
     if size == 0 || size > SHM_MAX_SIZE { return u64::MAX; }
@@ -115,7 +116,7 @@ pub fn sys_shm_map(handle: u64, mode: u64) -> u64 {
     };
 
     // Map chaque frame du handle dans l'AS du process courant.
-    let flags = if mode & SHM_MODE_RW != 0 {
+    let flags = if mode & SHM_MODE_WRITE != 0 {
         PageTableFlags::PRESENT
             | PageTableFlags::WRITABLE
             | PageTableFlags::USER_ACCESSIBLE

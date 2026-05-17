@@ -24,8 +24,8 @@ kernel: userland
 	$(MAKE) -C kernel
 
 userland:
-	@echo "[os] userland : build init + sh"
-	cd userland && cargo -Zjson-target-spec build --release -p init -p sh
+	@echo "[os] userland : build init + sh + displayd"
+	cd userland && cargo -Zjson-target-spec build --release -p init -p sh -p displayd
 
 run: kernel
 	$(MAKE) -C kernel run

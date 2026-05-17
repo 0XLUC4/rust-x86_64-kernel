@@ -4,6 +4,7 @@ members = [
     "crates/ulib",
     "init",
     "sh",
+    "displayd",
 ]
 
 [profile.release]
