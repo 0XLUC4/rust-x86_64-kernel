@@ -161,3 +161,14 @@ pub fn find_first_fat32() -> Option<(usize, u32, u32)> {
     }
     None
 }
+
+/// Cherche la première partition Linux (type 0x83 — souvent ext2/3/4).
+pub fn find_first_linux() -> Option<(usize, u32, u32)> {
+    let lock = PARTITIONS.get()?.lock();
+    for p in lock.iter() {
+        if matches!(p.part_type, PartitionType::Linux) {
+            return Some((p.disk_idx, p.start_lba, p.sectors));
+        }
+    }
+    None
+}
