@@ -14,9 +14,13 @@
 // laisse au display-server (user space) toute la sémantique au-dessus.
 // =============================================================================
 
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 use spin::Mutex;
+use x86_64::{PhysAddr, VirtAddr};
+use x86_64::structures::paging::{Page, PageTableFlags, PhysFrame, Size4KiB};
 
+use crate::memory::paging::{self, PHYS_OFFSET};
 use crate::task::process::{self, Pid};
 
 mod fb_info;
@@ -30,6 +34,16 @@ static FB_OWNER: AtomicU64 = AtomicU64::new(0);
 
 /// Lock d'arbitrage pour acquire/release atomiques + bookkeeping.
 static FB_LOCK: Mutex<()> = Mutex::new(());
+
+/// Frames physiques persistantes du backbuffer partagé (allouées au 1er ACQUIRE,
+/// jamais libérées — réutilisées entre owners successifs).
+static FB_BACKBUF_FRAMES: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+/// VA du backbuffer dans l'espace du owner courant (0 si pas mappé).
+static FB_BACKBUF_VA: AtomicU64 = AtomicU64::new(0);
+/// Taille du backbuffer en bytes (set au 1er ACQUIRE).
+static FB_BACKBUF_LEN: AtomicU64 = AtomicU64::new(0);
+/// VA fixe où le backbuffer est exposé chez le display-server.
+const FB_USER_VA: u64 = 0x0000_5000_0000_0000;
 
 // -----------------------------------------------------------------------------
 // FB_ACQUIRE
@@ -54,9 +68,78 @@ pub fn sys_fb_acquire(out_ptr: u64) -> u64 {
     }
     FB_OWNER.store(caller, Ordering::Release);
 
-    let info = match fb_info::query_kernel_fb() {
-        Some(i) => i,
+    // Dimensions & pitch du framebuffer kernel.
+    let (width, height, pitch) = match crate::drivers::fb::fb() {
+        Some(fb_mx) => {
+            let fb = fb_mx.lock();
+            (fb.width(), fb.height(), fb.pitch_bytes())
+        }
         None => return u64::MAX,
+    };
+    let buffer_len = pitch as u64 * height as u64;
+    let pages = (buffer_len + 4095) / 4096;
+
+    // Alloue les frames une seule fois (lazy), réutilisées pour tous les
+    // owners successifs.
+    {
+        let mut frames = FB_BACKBUF_FRAMES.lock();
+        if frames.is_empty() {
+            for _ in 0..pages {
+                match paging::alloc_zeroed_frame() {
+                    Ok(pf) => frames.push(pf.start_address().as_u64()),
+                    Err(_) => {
+                        // Rollback partiel.
+                        for &pa in frames.iter() {
+                            if let Ok(pf) = PhysFrame::<Size4KiB>::from_start_address(PhysAddr::new(pa)) {
+                                paging::free_frame(pf);
+                            }
+                        }
+                        frames.clear();
+                        FB_OWNER.store(0, Ordering::Release);
+                        return u64::MAX;
+                    }
+                }
+            }
+            FB_BACKBUF_LEN.store(buffer_len, Ordering::Release);
+        }
+    }
+
+    // Map le backbuffer dans l'AS du caller à FB_USER_VA.
+    let frames_copy: Vec<u64> = FB_BACKBUF_FRAMES.lock().clone();
+    {
+        let mut table = process::PROCS.lock();
+        let proc = match table.current() {
+            Some(p) => p, None => {
+                FB_OWNER.store(0, Ordering::Release);
+                return u64::MAX;
+            }
+        };
+        let flags = PageTableFlags::PRESENT
+            | PageTableFlags::WRITABLE
+            | PageTableFlags::USER_ACCESSIBLE;
+        for (i, &pa) in frames_copy.iter().enumerate() {
+            let va = FB_USER_VA + i as u64 * 4096;
+            let page = Page::<Size4KiB>::containing_address(VirtAddr::new(va));
+            let frame = match PhysFrame::<Size4KiB>::from_start_address(PhysAddr::new(pa)) {
+                Ok(f) => f, Err(_) => {
+                    FB_OWNER.store(0, Ordering::Release);
+                    return u64::MAX;
+                }
+            };
+            if proc.address_space.map_to(page, frame, flags).is_err() {
+                // Si déjà mappé (re-ACQUIRE par le même owner), on tolère.
+            }
+        }
+    }
+    FB_BACKBUF_VA.store(FB_USER_VA, Ordering::Release);
+
+    let info = FbInfoAbi {
+        buffer_ptr: FB_USER_VA,
+        buffer_len,
+        width, height, pitch,
+        format: fb_info::PIXEL_FORMAT_BGRA8888,
+        caps:   fb_info::CAP_DOUBLE_BUF,
+        _reserved: 0,
     };
 
     // Validation user pointer.
@@ -89,7 +172,7 @@ pub fn sys_fb_present(rect_ptr: u64) -> u64 {
         return u64::MAX; // EPERM
     }
 
-    // Lire la Rect (16 bytes : 4×u32). 0 = full present.
+    // Lire la Rect (16 bytes : 4×u32). 0 = full present (ignoré : on copie tout).
     let _rect: (u32, u32, u32, u32) = if rect_ptr == 0 {
         (0, 0, 0, 0)
     } else {
@@ -100,9 +183,36 @@ pub fn sys_fb_present(rect_ptr: u64) -> u64 {
         (r(0), r(4), r(8), r(12))
     };
 
-    // Pipeline FB : commit + present.
+    // Blit le backbuffer partagé (frames identity-mappées via PHYS_OFFSET)
+    // vers le present_buf du driver fb, puis pipeline standard.
+    let frames = FB_BACKBUF_FRAMES.lock().clone();
+    let buffer_len = FB_BACKBUF_LEN.load(Ordering::Acquire);
     if let Some(fb_mx) = crate::drivers::fb::fb() {
         let mut fb = fb_mx.lock();
+        let pitch_u32 = fb.pitch_bytes() / 4;
+        let width = fb.width();
+        let height = fb.height();
+        // SAFETY: frames physiques identity-mappées, présentes pour la durée
+        // de vie du backbuffer (alloué au 1er ACQUIRE).
+        let mut copied = 0u64;
+        for (i, &pa) in frames.iter().enumerate() {
+            let src_base = (pa + PHYS_OFFSET) as *const u32;
+            let bytes_in_page = (4096u64).min(buffer_len - copied);
+            let words = (bytes_in_page / 4) as usize;
+            unsafe {
+                for j in 0..words {
+                    let offset_bytes = i as u64 * 4096 + j as u64 * 4;
+                    let pixel_index = offset_bytes / 4;
+                    let y = (pixel_index / pitch_u32 as u64) as u32;
+                    let x = (pixel_index % pitch_u32 as u64) as u32;
+                    if y < height && x < width {
+                        let px = core::ptr::read_volatile(src_base.add(j));
+                        fb.put_pixel(x, y, px);
+                    }
+                }
+            }
+            copied += bytes_in_page;
+        }
         fb.commit();
         fb.present();
     }
@@ -145,9 +255,12 @@ pub fn sys_input_poll(buf_ptr: u64, max: u64) -> u64 {
 }
 
 /// Hook process::exit : si le process qui meurt détenait le FB, on libère.
+/// Le mapping du backbuffer dans son AS est détruit avec la P4 du process.
+/// Les frames du backbuffer restent allouées (pool persistant cross-owners).
 pub fn release_if_owner(pid: Pid) {
     let _g = FB_LOCK.lock();
     if FB_OWNER.load(Ordering::Acquire) == pid as u64 {
         FB_OWNER.store(0, Ordering::Release);
+        FB_BACKBUF_VA.store(0, Ordering::Release);
     }
 }
