@@ -149,6 +149,37 @@ pub fn udp_send(
     sock.send_slice(data, endpoint).map_err(|_| "udp send error")
 }
 
+/// Reçoit un datagramme UDP. Retourne (len, src_addr, src_port) si dispo.
+/// Non-bloquant : si rien à lire, renvoie Err("would-block").
+pub fn udp_recv(
+    handle: SocketHandle,
+    buf: &mut [u8],
+) -> Result<(usize, Ipv4Address, u16), &'static str> {
+    let net = NET.get().ok_or("net non init")?;
+    let mut stack = net.lock();
+
+    let now = Instant::from_millis(crate::time::uptime_ms() as i64);
+    {
+        let crate::net::NetStack { ref mut iface, ref mut device, ref mut sockets, .. } = &mut *stack;
+        let _ = iface.poll(now, device, sockets);
+    }
+
+    let sock = stack.sockets.get_mut::<udp::Socket>(handle);
+    if !sock.can_recv() {
+        return Err("would-block");
+    }
+    match sock.recv_slice(buf) {
+        Ok((n, meta)) => {
+            let v4 = match meta.endpoint.addr {
+                IpAddress::Ipv4(v) => v,
+                _ => return Err("not ipv4"),
+            };
+            Ok((n, v4, meta.endpoint.port))
+        }
+        Err(_) => Err("udp recv error"),
+    }
+}
+
 /// Vérifie si le lien réseau est actif.
 pub fn link_up() -> bool {
     crate::drivers::e1000::nic()

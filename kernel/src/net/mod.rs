@@ -21,6 +21,7 @@
 
 pub mod socket;
 pub mod http;
+pub mod dns;
 
 use alloc::{vec, vec::Vec};
 use spin::{Mutex, Once};
@@ -90,6 +91,8 @@ pub struct NetStack {
     pub sockets: SocketSet<'static>,
     pub dhcp_handle: Option<SocketHandle>,
     pub dhcp_configured: bool,
+    pub dns_server: Option<Ipv4Address>,
+    pub gateway:    Option<Ipv4Address>,
 }
 
 static NET: Once<Mutex<NetStack>> = Once::new();
@@ -131,6 +134,8 @@ pub fn init() {
         sockets,
         dhcp_handle: Some(dhcp_handle),
         dhcp_configured: false,
+        dns_server: None,
+        gateway: None,
     }));
 }
 
@@ -141,7 +146,8 @@ pub fn poll() {
         let now = Instant::from_millis(crate::time::uptime_ms() as i64);
         let NetStack {
             ref mut iface, ref mut device, ref mut sockets,
-            dhcp_handle, dhcp_configured, ..
+            dhcp_handle, dhcp_configured,
+            dns_server, gateway, ..
         } = &mut *stack;
         let _ = iface.poll(now, device, sockets);
 
@@ -155,6 +161,8 @@ pub fn poll() {
                         iface.update_ip_addrs(|a| a.clear());
                         iface.routes_mut().remove_default_ipv4_route();
                         *dhcp_configured = false;
+                        *dns_server = None;
+                        *gateway = None;
                     }
                     dhcpv4::Event::Configured(cfg) => {
                         crate::println!("[dhcp] bail OK : IP={} mask=/{}",
@@ -169,10 +177,12 @@ pub fn poll() {
                             crate::println!("[dhcp] gateway = {}", router);
                             crate::serial_println!("[dhcp] gateway = {}", router);
                             let _ = iface.routes_mut().add_default_ipv4_route(router);
+                            *gateway = Some(router);
                         }
                         if let Some(&dns) = cfg.dns_servers.first() {
                             crate::println!("[dhcp] dns     = {}", dns);
                             crate::serial_println!("[dhcp] dns     = {}", dns);
+                            *dns_server = Some(dns);
                         }
                         *dhcp_configured = true;
                     }
@@ -184,6 +194,14 @@ pub fn poll() {
 
 pub fn dhcp_configured() -> bool {
     NET.get().map(|n| n.lock().dhcp_configured).unwrap_or(false)
+}
+
+pub fn dns_server() -> Option<Ipv4Address> {
+    NET.get().and_then(|n| n.lock().dns_server)
+}
+
+pub fn gateway() -> Option<Ipv4Address> {
+    NET.get().and_then(|n| n.lock().gateway)
 }
 
 pub fn stack() -> Option<&'static Mutex<NetStack>> {
