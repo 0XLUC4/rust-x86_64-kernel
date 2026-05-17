@@ -15,6 +15,7 @@
 
 use alloc::vec;
 use alloc::string::String;
+use spin::Mutex;
 use smoltcp::iface::SocketHandle;
 use smoltcp::socket::tcp;
 use smoltcp::time::Instant;
@@ -23,6 +24,10 @@ use super::NET;
 
 const LISTEN_PORT: u16 = 8080;
 
+/// Handle vivant du listener courant ; on le remplace après chaque réponse
+/// pour éviter le TIME_WAIT bloquant sur un socket unique.
+static CURRENT: Mutex<Option<SocketHandle>> = Mutex::new(None);
+
 pub async fn serve() {
     let start = crate::time::uptime_ms();
     while crate::net::NET.get().is_none() {
@@ -30,62 +35,88 @@ pub async fn serve() {
         if crate::time::uptime_ms() - start > 5000 { return; }
     }
 
-    let handle = match create_listening_socket() {
-        Some(h) => h,
-        None => {
-            crate::serial_println!("[http] init failed");
-            return;
-        }
-    };
+    install_listener();
     crate::println!("[http] listening :{}", LISTEN_PORT);
 
     loop {
         crate::time::sleep::sleep_ms(100).await;
-        tick(handle);
+        tick();
     }
 }
 
-fn create_listening_socket() -> Option<SocketHandle> {
-    let net = NET.get()?;
+/// Crée un socket TCP en listen, l'ajoute au SocketSet, stocke le handle.
+fn install_listener() {
+    let Some(net) = NET.get() else { return; };
     let mut stack = net.lock();
     let rx = tcp::SocketBuffer::new(vec![0u8; 2048]);
     let tx = tcp::SocketBuffer::new(vec![0u8; 16384]);
     let mut socket = tcp::Socket::new(rx, tx);
-    socket.listen(LISTEN_PORT).ok()?;
-    Some(stack.sockets.add(socket))
+    if socket.listen(LISTEN_PORT).is_ok() {
+        let h = stack.sockets.add(socket);
+        *CURRENT.lock() = Some(h);
+    }
 }
 
-fn tick(handle: SocketHandle) {
-    let Some(net) = NET.get() else { return; };
-    let mut stack = net.lock();
-    let now = Instant::from_millis(crate::time::uptime_ms() as i64);
-    let crate::net::NetStack { ref mut iface, ref mut device, ref mut sockets, .. } = &mut *stack;
-    let _ = iface.poll(now, device, sockets);
+fn tick() {
+    // Étape 1 : sous lock NET, poll + drain RX dans un buffer local, lire l'état.
+    let (state, request_opt, handle) = {
+        let Some(net) = NET.get() else { return; };
+        let mut stack = net.lock();
+        let now = Instant::from_millis(crate::time::uptime_ms() as i64);
+        {
+            let crate::net::NetStack { ref mut iface, ref mut device, ref mut sockets, .. } = &mut *stack;
+            let _ = iface.poll(now, device, sockets);
+        }
+        let handle = match *CURRENT.lock() { Some(h) => h, None => return };
+        let sock = stack.sockets.get_mut::<tcp::Socket>(handle);
+        let state = sock.state();
+        let req = if sock.can_recv() {
+            let mut tmp = [0u8; 1024];
+            match sock.recv_slice(&mut tmp) {
+                Ok(n) if n > 0 => Some(alloc::vec::Vec::from(&tmp[..n])),
+                _ => None,
+            }
+        } else { None };
+        (state, req, handle)
+    };
 
-    let sock = sockets.get_mut::<tcp::Socket>(handle);
-
-    if sock.state() == tcp::State::Closed {
-        let _ = sock.listen(LISTEN_PORT);
+    // Étape 2 : recycle ou close — sous lock NET court.
+    if state == tcp::State::Closed {
+        if let Some(net) = NET.get() {
+            let mut stack = net.lock();
+            stack.sockets.remove(handle);
+        }
+        *CURRENT.lock() = None;
+        install_listener();
+        return;
+    }
+    if state == tcp::State::CloseWait {
+        if let Some(net) = NET.get() {
+            let mut stack = net.lock();
+            let sock = stack.sockets.get_mut::<tcp::Socket>(handle);
+            sock.close();
+        }
         return;
     }
 
-    if sock.can_recv() {
-        let mut req_bytes = [0u8; 1024];
-        if let Ok(n) = sock.recv_slice(&mut req_bytes) {
-            if n > 0 {
-                let req = core::str::from_utf8(&req_bytes[..n]).unwrap_or("");
-                crate::serial_println!("[http] {} bytes : {:.60}", n, req);
+    // Étape 3 : SANS lock NET, on route + génère la réponse. Les handlers
+    // (api_net, api_dns) reprennent le lock NET de leur côté.
+    let Some(bytes) = request_opt else { return; };
+    let req = core::str::from_utf8(&bytes).unwrap_or("");
+    crate::serial_println!("[http] {} bytes : {:.60}", bytes.len(), req);
+    let (method, path) = parse_request_line(req);
+    let resp = if method != "GET" {
+        response_text(405, "Method Not Allowed", "Only GET\n")
+    } else {
+        route(path)
+    };
 
-                let (method, path) = parse_request_line(req);
-                let resp = if method != "GET" {
-                    response_text(405, "Method Not Allowed", "Only GET\n")
-                } else {
-                    route(path)
-                };
-                let _ = sock.send_slice(resp.as_bytes());
-                sock.close();
-            }
-        }
+    // Étape 4 : re-lock NET et envoie la réponse.
+    if let Some(net) = NET.get() {
+        let mut stack = net.lock();
+        let sock = stack.sockets.get_mut::<tcp::Socket>(handle);
+        let sent = sock.send_slice(resp.as_bytes()).unwrap_or(0);
+        crate::serial_println!("[http] respond {} B sent", sent);
     }
 }
 
