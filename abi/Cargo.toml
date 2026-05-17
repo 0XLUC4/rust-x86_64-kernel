@@ -1,0 +1,19 @@
+[package]
+name = "dos-abi"
+version = "0.1.0"
+edition = "2021"
+description = "ABI binaire-stable partagée entre le kernel d/OS et userland (syscalls graphiques + IPC + shm)."
+
+# Pas de dépendance — uniquement des types repr(C).
+# Cette crate doit pouvoir être compilée pour la cible kernel ET la cible
+# userland sans modification.
+[dependencies]
+
+[lib]
+path = "src/lib.rs"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"

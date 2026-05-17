@@ -1,0 +1,15 @@
+[unstable]
+build-std = ["core", "compiler_builtins", "alloc"]
+build-std-features = ["compiler-builtins-mem"]
+
+[build]
+target = "x86_64-user.json"
+target-dir = "target"
+
+[target.x86_64-user]
+rustflags = [
+    "-C", "link-arg=-T",
+    "-C", "link-arg=link.ld",
+    "-C", "link-arg=-nostdlib",
+    "-C", "link-arg=--gc-sections",
+]

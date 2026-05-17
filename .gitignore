@@ -1,0 +1,30 @@
+# Rust
+target/
+**/target/
+Cargo.lock.bak
+*.rs.bk
+
+# Kernel build artifacts
+kernel/build/
+kernel/target/
+userland/target/
+
+# Editor / OS / Tooling
+.vscode/
+.idea/
+.claude/
+.cursor/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Debug
+*.log
+core
+*.dump
+
+# Disk images
+*.img
+*.iso
+!kernel/build/.gitkeep

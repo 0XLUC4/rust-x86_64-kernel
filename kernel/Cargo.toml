@@ -1,0 +1,50 @@
+[package]
+name = "rust_kernel"
+version = "0.1.0"
+edition = "2021"
+authors = ["You"]
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+
+[lib]
+name = "rust_kernel"
+path = "src/main.rs"
+crate-type = ["staticlib"]
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+lto = true
+codegen-units = 1
+
+[dependencies]
+spin = "0.9"                    # Mutex sans std
+volatile = "0.2.6"              # Ecritures volatile (VGA)
+lazy_static = { version = "1.4", features = ["spin_no_std"] }
+x86_64 = "0.14"                 # Helpers x86_64 (registres, paging, etc.)
+pic8259 = "0.10"                # PIC 8259
+pc-keyboard = "0.7"             # Décodage scancodes
+linked_list_allocator = "0.10"  # Heap allocator
+uart_16550 = "0.2"              # Port série (debug QEMU)
+conquer-once = { version = "0.4", default-features = false }
+crossbeam-queue = { version = "0.3", default-features = false, features = ["alloc"] }
+futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
+smoltcp = { version = "0.11", default-features = false, features = [
+    "medium-ethernet",
+    "proto-ipv4",
+    "proto-dhcpv4",
+    "socket-tcp",
+    "socket-udp",
+    "socket-icmp",
+    "socket-raw",
+    "socket-dhcpv4",
+    "alloc",
+] }
+
+[package.metadata.cargo-xbuild]
+memcpy = true
+sysroot_path = "target/sysroot"

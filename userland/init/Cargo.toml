@@ -1,0 +1,21 @@
+[package]
+name = "init"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "init"
+path = "src/main.rs"
+
+[dependencies]
+ulib = { path = "../crates/ulib" }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+lto = true
+codegen-units = 1
+opt-level = "s"
+strip = true
