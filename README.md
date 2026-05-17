@@ -229,17 +229,17 @@ OS/
 - [x] **Phase II** — ring 3 userspace: ELF64 loader, fork (CoW), execve, signals, SYSCALL/SYSRET
 - [x] **Phase III** — persistence & network: MBR + FAT32 read-only, e1000, TCP/IP via smoltcp
 - [x] **Phase IV** — UX: 1024×768 framebuffer, pixel console, status bar, ring 3 preemption
+- [x] **Phase V step 2** — graphics ABI: real `sys_shm_map/unmap` with page-table mapping, `FB_ACQUIRE` returns shared backbuffer at fixed user VA, ring-3 `displayd` skeleton
+- [x] **DHCP** + **DNS resolver** + **HTTP server with JSON API** (`/api/uptime`, `/api/mem`, `/api/procs`, `/api/net`, `/api/dns?host=...`)
+- [x] **FAT32 write** — create / replace / unlink root files (8.3 names, cluster chain allocation, FAT entry updates on both copies)
+- [x] **ext2 read-only** — superblock + BGD + inode + direct/single-indirect file read + dir listing
+- [x] **NVMe** controller skeleton — PCI detect, MMIO map, admin SQ/CQ, IDENTIFY CONTROLLER
+- [x] **POSIX-ish libc in `ulib`** — bump allocator (`malloc/free/calloc/realloc`), `errno` + `perror`, `printf` (via `println!`)
 
-**In progress**
-- [ ] **Phase V** — graphics ABI: SHM, IPC, display-server in ring 3 (shell exits the kernel)
-
-**Future**
-- [ ] SMP (boot APs via IPI INIT/SIPI, per-core scheduler)
-- [ ] DHCP + DNS resolver, minimal HTTP server
-- [ ] FAT32 write support, ext2 read-only
-- [ ] Higher-half kernel + KASLR
-- [ ] NVMe driver
-- [ ] POSIX-ish libc (so real userspace programs compile)
+**Designed, deferred until QEMU iteration loop is in place** ([docs/](docs/))
+- [ ] **SMP** — APs via IPI INIT/SIPI, per-core runqueue, TLB shootdown ([SMP.md](docs/SMP.md))
+- [ ] **Higher-half kernel + KASLR** — `0xFFFF_8000_0000_0000`, PIE relocations ([HIGHER_HALF_KASLR.md](docs/HIGHER_HALF_KASLR.md))
+- [ ] **Shell → userland** — move 35 kernel-shell commands to `/bin/*` user binaries ([SHELL_TO_USERLAND.md](docs/SHELL_TO_USERLAND.md))
 
 ---
 
