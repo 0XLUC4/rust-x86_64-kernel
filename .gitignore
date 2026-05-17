@@ -23,6 +23,7 @@ Thumbs.db
 *.log
 core
 *.dump
+.commit-msg.tmp
 
 # Disk images
 *.img
