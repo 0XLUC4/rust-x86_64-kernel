@@ -13,9 +13,13 @@
 
 #![no_std]
 
+extern crate alloc;
+
 pub mod syscall;
 pub mod io;
 pub mod process;
+pub mod mem;
+pub mod errno;
 
 // Re-exports pratiques.
 pub use syscall::{
@@ -25,6 +29,7 @@ pub use syscall::{
 };
 pub use io::{stdout, stderr, stdin_line};
 pub use process::{fork_exec_wait, spawn};
+pub use errno::{errno, set_errno, errno_str, perror};
 
 /// Runtime : macro qui plante un `_start` + appelle `main`.
 /// Utiliser comme :
