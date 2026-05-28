@@ -31,6 +31,9 @@ static LOGOUT_REQUESTED: AtomicBool = AtomicBool::new(false);
 /// Appelée depuis `shell::run()` au démarrage si on est en mode TTY.
 pub async fn run() {
     LOGOUT_REQUESTED.store(false, Ordering::Relaxed);
+    // Laisse l'utilisateur voir les infos de boot avant de basculer en login.
+    crate::time::sleep::sleep_ms(2500).await;
+    clear_screen();
     let mut kb = KeyStream::new();
     print_motd();
 
@@ -102,6 +105,14 @@ async fn read_line(kb: &mut KeyStream, hide: bool) -> String {
         }
     }
     line
+}
+
+fn clear_screen() {
+    if crate::drivers::console::is_ready() {
+        crate::drivers::console::clear();
+    } else {
+        crate::drivers::vga::WRITER.lock().clear_screen();
+    }
 }
 
 fn print_motd() {
