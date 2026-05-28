@@ -14,6 +14,10 @@ preemptive scheduler, FAT32, TCP/IP, framebuffer console — all written from ze
 [![LOC](https://img.shields.io/badge/code-~13k%20LOC-purple)]()
 [![Status](https://img.shields.io/badge/status-educational-yellow)]()
 
+<br>
+
+<img src="docs/boot.gif" alt="Boot demo: GRUB → kernel init → TTY login → shell" width="780">
+
 </div>
 
 ---
